@@ -9,7 +9,7 @@
 
 You can install SimpleWebSocketServer by running the following command...
 
-`sudo pip install git+https://github.com/dpallot/simple-websocket-server.git`
+`pip install SimpleWebSocketServer`
 
 Or by downloading the repository and running `sudo python setup.py install`.  
 Installation via pip is suggested.
@@ -25,10 +25,10 @@ class SimpleEcho(WebSocket):
         self.sendMessage(self.data)
 
     def handleConnected(self):
-        print self.address, 'connected'
+        print(self.address, 'connected')
 
     def handleClose(self):
-        print self.address, 'closed'
+        print(self.address, 'closed')
 
 server = SimpleWebSocketServer('', 8000, SimpleEcho)
 server.serveforever()
@@ -49,14 +49,14 @@ class SimpleChat(WebSocket):
              client.sendMessage(self.address[0] + u' - ' + self.data)
 
     def handleConnected(self):
-       print self.address, 'connected'
+       print(self.address, 'connected')
        for client in clients:
           client.sendMessage(self.address[0] + u' - connected')
        clients.append(self)
 
     def handleClose(self):
        clients.remove(self)
-       print self.address, 'closed'
+       print(self.address, 'closed')
        for client in clients:
           client.sendMessage(self.address[0] + u' - disconnected')
 
@@ -82,7 +82,7 @@ Chat Server (open up multiple *websocket.html* files)
 
 1) Generate a certificate with key
 
-    openssl req -new -x509 -days 365 -nodes -out cert.pem -keyout cert.pem
+    openssl req -new -x509 -days 365 -nodes -out cert.pem -keyout key.pem
 
 2) Run the secure TSL/SSL server (in this case the cert.pem file is in the same directory)
 
@@ -106,8 +106,10 @@ handleConnected: called when handshake is complete
  - self.address: TCP address port tuple of the endpoint
 
 handleClose: called when the endpoint is closed or there is an error
+ - self.address: TCP address port tuple of the endpoint
 
 handleMessage: gets called when there is an incoming message from the client endpoint
+ - self.address: TCP address port tuple of the endpoint
  - self.opcode: the WebSocket frame type (STREAM, TEXT, BINARY)
  - self.data: bytearray (BINARY frame) or unicode string payload (TEXT frame)  
  - self.request: HTTP details from the WebSocket handshake (refer to BaseHTTPRequestHandler)

@@ -31,7 +31,7 @@ def _check_unicode(val):
     if VER >= 3:
         return isinstance(val, str)
     else:
-        return isinstance(val, unicode)
+        return isinstance(val, basestring)
 
 class HTTPRequest(BaseHTTPRequestHandler):
    def __init__(self, request_text):
@@ -51,6 +51,15 @@ HANDSHAKE_STR = (
    "Upgrade: WebSocket\r\n"
    "Connection: Upgrade\r\n"
    "Sec-WebSocket-Accept: %(acceptstr)s\r\n\r\n"
+)
+
+FAILED_HANDSHAKE_STR = (
+   "HTTP/1.1 426 Upgrade Required\r\n"
+   "Upgrade: WebSocket\r\n"
+   "Connection: Upgrade\r\n"
+   "Sec-WebSocket-Version: 13\r\n"
+   "Content-Type: text/plain\r\n\r\n"
+   "This service requires use of the WebSocket protocol\r\n"
 )
 
 GUID_STR = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
@@ -244,7 +253,7 @@ class WebSocket(object):
 
          data = self.client.recv(self.headertoread)
          if not data:
-            raise Exception("remote socket closed")
+            raise Exception('remote socket closed')
 
          else:
             # accumulate
@@ -267,11 +276,14 @@ class WebSocket(object):
                   self.handshaked = True
                   self.handleConnected()
                except Exception as e:
+                  hStr = FAILED_HANDSHAKE_STR
+                  self._sendBuffer(hStr.encode('ascii'), True)
+                  self.client.close()
                   raise Exception('handshake failed: %s', str(e))
 
       # else do normal data
       else:
-         data = self.client.recv(8192)
+         data = self.client.recv(16384)
          if not data:
             raise Exception("remote socket closed")
 
@@ -305,7 +317,7 @@ class WebSocket(object):
             self.closed = True
 
 
-   def _sendBuffer(self, buff):
+   def _sendBuffer(self, buff, send_all = False):
       size = len(buff)
       tosend = size
       already_sent = 0
@@ -315,7 +327,7 @@ class WebSocket(object):
             # i should be able to send a bytearray
             sent = self.client.send(buff[already_sent:])
             if sent == 0:
-               raise RuntimeError("socket connection broken")
+               raise RuntimeError('socket connection broken')
 
             already_sent += sent
             tosend -= sent
@@ -323,6 +335,8 @@ class WebSocket(object):
          except socket.error as e:
             # if we have full buffers then wait for them to drain and try again
             if e.errno in [errno.EAGAIN, errno.EWOULDBLOCK]:
+               if send_all:
+                   continue
                return buff[already_sent:]
             else:
                raise e
@@ -452,7 +466,7 @@ class WebSocket(object):
                   try:
                      self._handlePacket()
                   finally:
-                     self.state = self.HEADERB1
+                     self.state = HEADERB1
                      self.data = bytearray()
 
                # we have no mask and some payload
@@ -573,9 +587,19 @@ class WebSocket(object):
 class SimpleWebSocketServer(object):
    def __init__(self, host, port, websocketclass, selectInterval = 0.1):
       self.websocketclass = websocketclass
-      self.serversocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+      if (host == ''):
+         host = None
+
+      if host is None:
+         fam = socket.AF_INET6
+      else:
+         fam = 0
+
+      hostInfo = socket.getaddrinfo(host, port, fam, socket.SOCK_STREAM, socket.IPPROTO_TCP, socket.AI_PASSIVE)
+      self.serversocket = socket.socket(hostInfo[0][0], hostInfo[0][1], hostInfo[0][2])
       self.serversocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-      self.serversocket.bind((host, port))
+      self.serversocket.bind(hostInfo[0][4])
       self.serversocket.listen(5)
       self.selectInterval = selectInterval
       self.connections = {}
@@ -592,136 +616,99 @@ class SimpleWebSocketServer(object):
 
       for desc, conn in self.connections.items():
          conn.close()
+         self._handleClose(conn)
+
+   def _handleClose(self, client):
+      client.client.close()
+      # only call handleClose when we have a successful websocket connection
+      if client.handshaked:
          try:
-            conn.handleClose()
+            client.handleClose()
          except:
             pass
 
+   def serveonce(self):
+      writers = []
+      for fileno in self.listeners:
+         if fileno == self.serversocket:
+            continue
+         client = self.connections[fileno]
+         if client.sendq:
+            writers.append(fileno)
+
+      rList, wList, xList = select(self.listeners, writers, self.listeners, self.selectInterval)
+
+      for ready in wList:
+         client = self.connections[ready]
+         try:
+            while client.sendq:
+               opcode, payload = client.sendq.popleft()
+               remaining = client._sendBuffer(payload)
+               if remaining is not None:
+                   client.sendq.appendleft((opcode, remaining))
+                   break
+               else:
+                   if opcode == CLOSE:
+                      raise Exception('received client close')
+
+         except Exception as n:
+            self._handleClose(client)
+            del self.connections[ready]
+            self.listeners.remove(ready)
+
+      for ready in rList:
+         if ready == self.serversocket:
+            sock = None
+            try:
+               sock, address = self.serversocket.accept()
+               newsock = self._decorateSocket(sock)
+               newsock.setblocking(0)
+               fileno = newsock.fileno()
+               self.connections[fileno] = self._constructWebSocket(newsock, address)
+               self.listeners.append(fileno)
+            except Exception as n:
+               if sock is not None:
+                  sock.close()
+         else:
+            if ready not in self.connections:
+                continue
+            client = self.connections[ready]
+            try:
+               client._handleData()
+            except Exception as n:
+               self._handleClose(client)
+               del self.connections[ready]
+               self.listeners.remove(ready)
+
+      for failed in xList:
+         if failed == self.serversocket:
+            self.close()
+            raise Exception('server socket failed')
+         else:
+            if failed not in self.connections:
+               continue
+            client = self.connections[failed]
+            self._handleClose(client)
+            del self.connections[failed]
+            self.listeners.remove(failed)
+
    def serveforever(self):
       while True:
-         writers = []
-         for fileno in self.listeners:
-            try:
-               client = self.connections[fileno]
-               if client.sendq:
-                  writers.append(fileno)
-            except Exception as n:
-               pass
-
-         if self.selectInterval:
-            rList, wList, xList = select(self.listeners, writers, self.listeners, self.selectInterval)
-         else:
-            rList, wList, xList = select(self.listeners, writers, self.listeners)
-
-         for ready in wList:
-            client = None
-            try:
-               client = self.connections[ready]
-               while client.sendq:
-                  opcode, payload = client.sendq.popleft()
-                  remaining = client._sendBuffer(payload)
-                  if remaining is not None:
-                      client.sendq.appendleft((opcode, remaining))
-                      break
-                  else:
-                      if opcode == CLOSE:
-                         raise Exception("received client close")
-
-            except Exception as n:
-
-               if client:
-                  client.client.close()
-
-               try:
-                  if client:
-                     client.handleClose()
-               except:
-                  pass
-
-               try:
-                  del self.connections[ready]
-               except:
-                  pass
-
-               try:
-                  self.listeners.remove(ready)
-               except:
-                  pass
-
-         for ready in rList:
-            if ready == self.serversocket:
-               try:
-                  sock, address = self.serversocket.accept()
-                  newsock = self._decorateSocket(sock)
-                  newsock.setblocking(0)
-                  fileno = newsock.fileno()
-                  self.listeners.append(fileno)
-                  self.connections[fileno] = self._constructWebSocket(newsock, address)
-               except Exception as n:
-                  if sock is not None:
-                     sock.close()
-            else:
-               client = None
-               try:
-                  client = self.connections[ready]
-                  client._handleData()
-               except Exception as n:
-                  if client:
-                     client.client.close()
-
-                  try:
-                     if client:
-                        client.handleClose()
-                  except:
-                     pass
-
-                  try:
-                     del self.connections[ready]
-                  except:
-                     pass
-
-                  try:
-                     self.listeners.remove(ready)
-                  except:
-                     pass
-
-         for failed in xList:
-            if failed == self.serversocket:
-               self.close()
-               raise Exception("server socket failed")
-            else:
-               client = None
-               try:
-                   client = self.connections[failed]
-                   client.client.close()
-
-                   try:
-                      client.handleClose()
-                   except:
-                      pass
-
-                   try:
-                      self.listeners.remove(failed)
-                   except:
-                      pass
-
-               except:
-                  pass
-
-               finally:
-                  if client:
-                     del self.connections[failed]
+         self.serveonce()
 
 class SimpleSSLWebSocketServer(SimpleWebSocketServer):
 
-   def __init__(self, host, port, websocketclass, certfile,
-                keyfile, version = ssl.PROTOCOL_TLSv1, selectInterval = 0.1):
+   def __init__(self, host, port, websocketclass, certfile = None,
+                keyfile = None, version = ssl.PROTOCOL_TLSv1, selectInterval = 0.1, ssl_context = None):
 
       SimpleWebSocketServer.__init__(self, host, port,
                                         websocketclass, selectInterval)
 
-      self.context = ssl.SSLContext(version)
-      self.context.load_cert_chain(certfile, keyfile)
+      if ssl_context is None:
+         self.context = ssl.SSLContext(version)
+         self.context.load_cert_chain(certfile, keyfile)
+      else:
+         self.context = ssl_context
 
    def close(self):
       super(SimpleSSLWebSocketServer, self).close()
